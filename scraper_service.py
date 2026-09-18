@@ -4,20 +4,17 @@ SCRAPER SERVICE (RAM-hafif servis)
 Bu servis SADECE tarayici (Playwright) ile sayfa gorsellerini toplar.
 OCR / ceviri / cizim gibi agir islemler burada YOKTUR (o kisim main_service.py'de).
 
-CALISMA MANTIGI (istenen dongu):
-    1) POST /session/start      -> tarayiciyi acar, sayfaya gider, yapboz tespiti yapar,
-                                    ILK 10 sayfayi toplar, bir session_id doner.
-    2) POST /session/next       -> ayni tarayici oturumunda kaldigi yerden devam edip
-                                    (kaydirmaya/harvest'e devam ederek) SONRAKI 10 sayfayi doner.
-                                    "has_more": false donene kadar tekrar tekrar cagrilir.
-    3) POST /session/close      -> tarayiciyi kapatir, oturumu bellekten siler.
+CALISMA MANTIGI:
+    1) POST /session/start  -> sayfaya gider, yapboz tespiti yapar, ILK 10 sayfayi toplar
+    2) POST /session/next   -> ayni oturumda SONRAKI 10 sayfayi doner (has_more=false olana kadar)
+    3) POST /session/close  -> oturumu kapatir
 
-Boylece butun bolum tek seferde RAM'e yuklenmez; her an sadece ~10 sayfalik
-veri (URL ya da yapboz-cozulmus base64 gorsel) bellekte tutulur.
-
-Bir oturum, guvenlik icin belirli bir sureden fazla kullanilmazsa
-(SESSION_TTL_SECONDS) arka planda otomatik temizlenir; boylece unutulan
-oturumlar tarayiciyi acik birakip RAM sizdirmaz.
+DUZELTMELER (bu surumde):
+  * Butun Playwright (sync) islemleri TEK bir sabit thread'de (PW_EXECUTOR) calisir.
+    Boylece "Playwright Sync API inside the asyncio loop" ve "different thread" hatalari biter.
+  * Tek bir Chromium paylasilir, her oturum sadece ayri bir "context" acar (RAM tasarrufu).
+  * close() artik her yerde ayni thread uzerinden cagrilir (Chromium sizintisi biter).
+  * Ayni anda en fazla MAX_SESSIONS oturum acilabilir (RAM korumasi).
 """
 
 import os
@@ -27,8 +24,9 @@ import uuid
 import base64
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +35,7 @@ from playwright.sync_api import sync_playwright
 
 BATCH_SIZE = 10
 SESSION_TTL_SECONDS = 5 * 60  # 5 dakika hareketsiz kalan oturum otomatik kapanir
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "2"))
 
 app = FastAPI(title="Manga Scraper Service (RAM-hafif)")
 app.add_middleware(
@@ -67,10 +66,9 @@ BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-infobars",
-    # Docker konteynerlerinde /dev/shm varsayilan olarak cok kucuktur (64MB).
-    # Bu bayrak olmadan Chromium baslarken/render ederken cokebilir, servis
-    # genelinde 502 hatasina yol acar.
+    # Docker konteynerlerinde /dev/shm cok kucuktur (64MB); bu bayrak olmadan Chromium cokebilir.
     "--disable-dev-shm-usage",
+    "--disable-gpu",
     "--disable-web-security",
     "--allow-running-insecure-content",
     "--disable-features=IsolateOrigins,site-per-process",
@@ -109,53 +107,81 @@ JS_IMAGES_READY = """
 }
 """
 
+# ---------------------------------------------------------------------------
+# TEK SABIT PLAYWRIGHT THREAD'I
+# Sync Playwright nesneleri olusturuldugu thread'e baglidir. Bu yuzden hepsi
+# (baslatma, sayfa islemleri, kapatma) bu tek thread'de calistirilir.
+# ---------------------------------------------------------------------------
+PW_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
+_PW = {"pw": None, "browser": None}
+
+
+def _get_browser():
+    """Sadece PW_EXECUTOR thread'inde cagrilir. Tek paylasilan Chromium doner."""
+    if _PW["pw"] is None:
+        _PW["pw"] = sync_playwright().start()
+    browser = _PW["browser"]
+    if browser is None or not browser.is_connected():
+        _PW["browser"] = _PW["pw"].chromium.launch(headless=True, args=BROWSER_ARGS)
+    return _PW["browser"]
+
+
+async def run_pw(fn, *args):
+    """Verilen fonksiyonu Playwright thread'inde calistirir."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(PW_EXECUTOR, fn, *args)
+
 
 class ScrapeSession:
-    """Tek bir tarayici sekmesini canli tutan oturum. Kaydirmaya kaldigi yerden devam eder."""
+    """Tek bir tarayici context'ini canli tutan oturum. Kaydirmaya kaldigi yerden devam eder."""
 
     def __init__(self, session_id: str, url: str):
         self.session_id = session_id
         self.url = url
         self.last_used = time.time()
-        self.lock = threading.Lock()
         self.closed = False
-
-        self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=True, args=BROWSER_ARGS)
-        self.context = self.browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1600, "height": 2000},
-            bypass_csp=True,
-            ignore_https_errors=True,
-        )
-        self.page = self.context.new_page()
+        self.context = None
+        self.page = None
 
         # DOM'dan gorsel URL biriktirme (yapboz olmayan siteler icin)
         self.dom_seen = set()
-        self.dom_pending: List[str] = []  # henuz client'a gonderilmemis URL'ler
+        self.dom_pending: List[str] = []
 
-        # Yapboz-cozulmus gorseller icin: hangi elementleri zaten yakaladik
+        # Yapboz-cozulmus gorseller icin
         self.captured_element_count = 0
         self.scramble_mode = ""
         self.finished = False
 
         try:
-            self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        except Exception as e:
-            print(f"[SCRAPER] Sayfa yukleme zaman asimi: {e}")
-        self.page.wait_for_timeout(2000)
+            browser = _get_browser()
+            self.context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1600, "height": 2000},
+                bypass_csp=True,
+                ignore_https_errors=True,
+            )
+            self.page = self.context.new_page()
 
-        try:
-            self.scramble_mode = self.page.evaluate(JS_DETECT_SCRAMBLE) or ""
-        except Exception:
-            self.scramble_mode = ""
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                print(f"[SCRAPER] Sayfa yukleme zaman asimi: {e}")
+            self.page.wait_for_timeout(2000)
 
-        # Script/JSON icinden ilk taramada URL'leri de topla (yapboz yoksa isimize yarar)
-        if not self.scramble_mode:
-            self._harvest_script_json()
+            try:
+                self.scramble_mode = self.page.evaluate(JS_DETECT_SCRAMBLE) or ""
+            except Exception:
+                self.scramble_mode = ""
+
+            if not self.scramble_mode:
+                self._harvest_script_json()
+        except BaseException:
+            # Yarim kalan olusturmada context sizmasin
+            self.close()
+            raise
 
     # ---- YAPBOZ OLMAYAN SITELER: DOM'dan URL toplama ----
     def _harvest_dom(self):
@@ -303,7 +329,6 @@ class ScrapeSession:
 
         self.captured_element_count = idx
 
-        # daha fazla kaydirip yeni element cikip cikmayacagina bak
         more_scrollable = True
         try:
             prev_height = self.page.evaluate("() => document.body.scrollHeight")
@@ -328,15 +353,13 @@ class ScrapeSession:
         return self.next_batch_normal()
 
     def close(self):
+        """Sadece PW_EXECUTOR thread'inde cagrilmali (run_pw ile)."""
         if self.closed:
             return
         self.closed = True
         try:
-            self.browser.close()
-        except Exception:
-            pass
-        try:
-            self.playwright.stop()
+            if self.context is not None:
+                self.context.close()
         except Exception:
             pass
 
@@ -351,10 +374,14 @@ def _cleanup_loop():
         now = time.time()
         with SESSIONS_LOCK:
             stale = [sid for sid, s in SESSIONS.items() if now - s.last_used > SESSION_TTL_SECONDS]
-            for sid in stale:
-                print(f"[SCRAPER] Zaman asimina ugrayan oturum kapatiliyor: {sid}")
-                SESSIONS[sid].close()
-                del SESSIONS[sid]
+            victims = [SESSIONS.pop(sid) for sid in stale]
+        for s in victims:
+            print(f"[SCRAPER] Zaman asimina ugrayan oturum kapatiliyor: {s.session_id}")
+            try:
+                # close() Playwright thread'inde calismali
+                PW_EXECUTOR.submit(s.close).result(timeout=60)
+            except Exception as e:
+                print(f"[SCRAPER] Kapatma hatasi: {e}")
 
 
 threading.Thread(target=_cleanup_loop, daemon=True).start()
@@ -379,13 +406,14 @@ async def start_session(payload: StartSessionRequest):
             "scramble_mode": "",
         }
 
+    with SESSIONS_LOCK:
+        if len(SESSIONS) >= MAX_SESSIONS:
+            raise HTTPException(status_code=429, detail="Scraper mesgul (cok fazla acik oturum), biraz sonra tekrar dene")
+
     session_id = uuid.uuid4().hex
 
-    def _create():
-        return ScrapeSession(session_id, payload.url)
-
     try:
-        session = await asyncio.to_thread(_create)
+        session = await run_pw(ScrapeSession, session_id, payload.url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Tarayici baslatilamadi: {e}")
 
@@ -393,18 +421,18 @@ async def start_session(payload: StartSessionRequest):
         SESSIONS[session_id] = session
 
     try:
-        first_batch = await asyncio.to_thread(session.next_batch)
+        first_batch = await run_pw(session.next_batch)
     except Exception as e:
-        session.close()
         with SESSIONS_LOCK:
             SESSIONS.pop(session_id, None)
+        await run_pw(session.close)
         raise HTTPException(status_code=500, detail=f"Ilk grup toplanamadi: {e}")
 
     result = {"session_id": session_id, **first_batch}
     if not first_batch["has_more"]:
-        session.close()
         with SESSIONS_LOCK:
             SESSIONS.pop(session_id, None)
+        await run_pw(session.close)
         result["session_id"] = None
 
     return result
@@ -419,17 +447,17 @@ async def next_session_batch(payload: SessionIdRequest):
         raise HTTPException(status_code=404, detail="Oturum bulunamadi veya zaman asimina ugradi")
 
     try:
-        batch = await asyncio.to_thread(session.next_batch)
+        batch = await run_pw(session.next_batch)
     except Exception as e:
-        session.close()
         with SESSIONS_LOCK:
             SESSIONS.pop(payload.session_id, None)
+        await run_pw(session.close)
         raise HTTPException(status_code=500, detail=f"Grup toplanamadi: {e}")
 
     if not batch["has_more"]:
-        session.close()
         with SESSIONS_LOCK:
             SESSIONS.pop(payload.session_id, None)
+        await run_pw(session.close)
 
     return {"session_id": payload.session_id, **batch}
 
@@ -439,5 +467,5 @@ async def close_session(payload: SessionIdRequest):
     with SESSIONS_LOCK:
         session = SESSIONS.pop(payload.session_id, None)
     if session:
-        await asyncio.to_thread(session.close)
+        await run_pw(session.close)
     return {"status": "success"}
