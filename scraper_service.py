@@ -67,6 +67,10 @@ BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-infobars",
+    # Docker konteynerlerinde /dev/shm varsayilan olarak cok kucuktur (64MB).
+    # Bu bayrak olmadan Chromium baslarken/render ederken cokebilir, servis
+    # genelinde 502 hatasina yol acar.
+    "--disable-dev-shm-usage",
     "--disable-web-security",
     "--allow-running-insecure-content",
     "--disable-features=IsolateOrigins,site-per-process",
